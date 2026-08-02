@@ -1,112 +1,119 @@
 ---
 name: VPN网络修复
-description: 修复老曾 Mac 上 Clash Verge 突然断网的问题。当用户说"连不上网""Clash挂了""代理失效""网断了""系统代理开关点不动""Clash Verge连不上"时触发。底层诊断+一键修复：mihomo内核僵死重启、系统代理端口被重置到2023（应为7897）、权限不足导致开关灰显。2026-07-25实战验证通过。
+description: 修复老曾 Mac 上 Clash Verge Rev / mihomo 突然断网、部分应用打不开、系统代理端口错误、内核僵死或代理开关灰显。用户说“连不上网”“Clash挂了”“代理失效”“网断了”“系统代理开关点不动”“浏览器打不开但终端能联网”时使用；按配置端口、监听端口、HTTP/HTTPS 系统代理和显式流量四层诊断，避免被终端代理环境变量或 lsof 漏报误导。
 ---
 
 # VPN网络修复（Clash Verge 断网急救）
 
-> 2026-07-25 实战验证：老曾 Mac 上 Clash Verge Rev（mihomo 内核）反复出现"连不上网"，根因是系统代理被外部程序重置到 2023 端口，而实际服务在 7897。
+> 2026-07-25 首次验证：系统代理被重置到 `2023`，实际服务在 `7897`。
+>
+> 2026-08-02 再次验证：HTTP 代理关闭、HTTPS 代理单独指向无监听的 `2023`；mihomo 与 `7897` 正常。只修系统代理即可恢复，无须重启内核。
 
----
+## 0. 环境
 
-## 0. 环境信息
+- Clash Verge Rev v2.5.1，mihomo 内核
+- 配置：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml`
+- 日志：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/logs/`
+- Unix Socket：`/tmp/verge/verge-mihomo.sock`
+- ClashX 已弃用；不要同时运行多个代理工具
 
-- **工具**：Clash Verge Rev v2.5.1，mihomo 内核
-- **配置目录**：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`
-- **配置文件**：`clash-verge.yaml`（`mixed-port: 7897`）
-- **日志目录**：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/logs/`
-- **Unix Socket**：`/tmp/verge/verge-mihomo.sock`
-- **注意**：ClashX 已弃用，两者会冲突
+## 1. 先诊断，后重启
 
----
+不要先假设端口永远是 `7897`。先从配置读取 `mixed-port`，再核对四层事实：
 
-## 1. 快速诊断（3步）
+1. 配置端口。
+2. mihomo 实际监听端口。
+3. macOS 的 HTTP 与 HTTPS 系统代理。
+4. 强制直连与显式代理的真实访问结果。
+
+优先运行只读诊断脚本：
 
 ```bash
-# 1. 看系统代理指向哪个端口
-networksetup -getwebproxy Wi-Fi | grep Port
-# 正常应该是 7897，如果是 2023 或其他值就是问题所在
-
-# 2. 看 7897 有没有在监听
-netstat -an | grep 7897 | grep LISTEN
-# 没有输出 = mihomo 没绑定端口（僵死）
-
-# 3. 看 mihomo 进程在不在
-pgrep -f verge-mihomo
-# 有 PID 但没端口 = 僵死状态
+bash scripts/diagnose.sh
 ```
 
----
+也可手动核对：
 
-## 2. 一键修复
+```bash
+clash_config="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+proxy_port=$(awk -F: '/^[[:space:]]*mixed-port:[[:space:]]*[0-9]+/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$clash_config")
 
-### 场景A：7897 在监听，只是系统代理指向错误
+networksetup -getwebproxy Wi-Fi
+networksetup -getsecurewebproxy Wi-Fi
+scutil --proxy
+netstat -anv -p tcp | grep -E "[.:]${proxy_port}[[:space:]].*LISTEN"
+pgrep -fal 'verge-mihomo|Clash Verge|clash-verge'
+
+# 真直连：忽略 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY，防止假阳性
+curl --noproxy '*' -L -sS -o /dev/null -w '直连百度: HTTP %{http_code}\n' \
+  --connect-timeout 5 --max-time 12 https://www.baidu.com
+
+# 真代理：显式指定配置中的 mixed-port
+curl -L -sS -o /dev/null -w '代理Google: HTTP %{http_code}\n' \
+  --connect-timeout 8 --max-time 15 -x "http://127.0.0.1:${proxy_port}" https://www.google.com
+```
+
+不要只查 `networksetup -getwebproxy Wi-Fi`。HTTP 与 HTTPS 可以出现不同的启用状态和端口，本次故障就是 HTTPS 单独错指 `2023`。
+
+不要用 `lsof` 的空结果直接判定“没监听”。2026-08-02 实测 `lsof` 漏报 `7897`，而 `netstat` 和显式代理请求都确认 mihomo 正常；以 `netstat + curl -x` 双证据为准。
+
+## 2. 按诊断矩阵修复
+
+### 场景 A：配置端口正在监听，显式代理可访问，但系统代理错误
+
+只修系统代理，不重启 Clash Verge。把下面的 `7897` 替换为当前配置中实际读取到的 `mixed-port`：
 
 ```bash
 osascript -e 'do shell script "networksetup -setwebproxy Wi-Fi 127.0.0.1 7897 && networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 7897" with administrator privileges'
 ```
 
-> 用 `osascript` 弹窗输密码，避免 `sudo` 在非交互终端卡住。
+使用 `osascript` 弹出管理员授权，避免非交互终端里的 `sudo` 卡住。`networksetup -setwebproxy` 与 `-setsecurewebproxy` 会同时写入地址、端口并启用对应代理。
 
-### 场景B：mihomo 僵死（进程在但没端口）或 7897 没监听
+### 场景 B：mihomo 进程在，但配置端口没监听或显式代理失败
 
 ```bash
-# 1. 杀掉 Clash Verge 全家桶
 pkill -f "Clash Verge"
 sleep 3
-
-# 2. 重启
 open -a "Clash Verge"
 sleep 6
-
-# 3. 确认 7897 恢复
-netstat -an | grep 7897 | grep LISTEN
-
-# 4. 修正系统代理
-osascript -e 'do shell script "networksetup -setwebproxy Wi-Fi 127.0.0.1 7897 && networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 7897" with administrator privileges'
+bash scripts/diagnose.sh
 ```
 
-### 场景C：Clash Verge 系统代理开关灰显点不动
+只有诊断脚本确认监听和显式代理恢复后，才执行场景 A 的系统代理修正。
 
-原因：Clash Verge 尝试用 PAC 模式或没有管理员权限。直接命令行设置 HTTP 代理（见场景A），然后去 Clash Verge 设置里确认代理模式是「规则模式」而非 PAC。
+### 场景 C：系统代理开关灰显
 
----
+直接使用场景 A 的命令设置 HTTP/HTTPS 代理，再在 Clash Verge 中确认代理模式是“规则模式”，不是 PAC。若仍灰显，再检查管理员权限，不要反复点击。
 
-## 3. 验证修复
+### 场景 D：直连也失败
+
+如果 `curl --noproxy '*'` 也失败，先检查 Wi-Fi 默认路由和 DNS；这不是单纯的 Clash 系统代理端口问题。不要通过重启 mihomo 掩盖底层网络故障。
+
+## 3. 验收
+
+修复后重新运行：
 
 ```bash
-# 直连测试
-curl -s -o /dev/null -w "百度: HTTP %{http_code}\n" --connect-timeout 5 https://www.baidu.com
-
-# 代理测试（Google 需走代理）
-curl -s -o /dev/null -w "Google: HTTP %{http_code}\n" --connect-timeout 10 -x http://127.0.0.1:7897 https://www.google.com
+bash scripts/diagnose.sh
 ```
 
-两个都 HTTP 200 = 修复成功。
+完成标准：
 
----
+- HTTP 与 HTTPS 均为 `Enabled: Yes`，并指向 `127.0.0.1:<mixed-port>`。
+- `netstat` 显示该端口由 mihomo 监听。
+- 强制直连和显式代理最终返回 HTTP 2xx/3xx；脚本返回码为 0。
+- 再用一个真实应用打开网页，排除“命令行通、应用仍未恢复”。
 
-## 4. 根因与预防
+Google 有时先返回 302；诊断命令使用 `-L` 跟随跳转，不把正常重定向误判为失败。
 
-### 为什么系统代理会被改成 2023？
+## 4. 已知坑
 
-- macOS 网络切换（Wi-Fi ↔ 有线 ↔ 热点）时可能重置代理设置
-- 其他代理类软件（VPN、Surge 等）可能抢占设置
-- Clash Verge 自身 bug 在某些版本会将端口写错
-
-### 预防措施
-
-1. **不要同时开多个代理工具**（ClashX 已移除自启动）
-2. **Clash Verge 设置里确认是「规则模式」不是 PAC**
-3. 如果频繁复发，可以写个 launchd 定时检查脚本
-
----
-
-## 5. 已知坑
-
-| 坑 | 现象 | 解法 |
+| 坑 | 误判/现象 | 正确做法 |
 |---|---|---|
-| `sudo` 卡 Password | 非交互终端无法输入密码 | 改用 `osascript` 弹窗 |
-| mihomo 僵死 | 进程在、端口没绑定 | `pkill` + `open -a` 重启 |
-| 开关灰显 | UI 点不动 | 命令行直接设 + 检查是否 PAC 模式 |
-| ClashX 冲突 | 两个代理工具抢端口 | 只保留 Clash Verge，ClashX 移除自启动 |
+| 只查 HTTP 代理 | 看不到 HTTPS 单独启用且端口错误 | 同时查 webproxy、securewebproxy 和 `scutil --proxy` |
+| 普通 `curl` 测“直连” | 环境变量已走代理，故障被掩盖 | 直连加 `--noproxy '*'` |
+| `lsof` 无输出 | 误判 mihomo 没监听 | 用 `netstat`，再用 `curl -x` 交叉验证 |
+| 一看到断网就重启 | 中断正常内核和现有连接 | 监听与显式代理正常时只修系统代理 |
+| `sudo` 卡 Password | 非交互终端无法输入密码 | 用 `osascript` 弹管理员授权 |
+| 开关灰显 | UI 点不动 | 命令行设置并检查 PAC/权限 |
+| 多代理工具冲突 | 端口反复被改 | 只保留 Clash Verge，移除 ClashX 自启动 |
